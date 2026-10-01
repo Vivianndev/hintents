@@ -8,6 +8,7 @@ package rpc
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +44,27 @@ const (
 	// DefaultWSEntryTTL is the duration an idle IP entry (with 0 active connections)
 	// is kept in memory before being evicted.
 	DefaultWSEntryTTL = 10 * time.Minute
+)
+
+// Default keepalive parameters used to reap dead WebSocket peers.
+const (
+	// DefaultWSPongWait is how long the server waits for any frame (data, ping
+	// or pong) from the client before the read deadline expires and the
+	// connection is considered dead.
+	DefaultWSPongWait = 60 * time.Second
+
+	// DefaultWSPingPeriod is the interval between server-initiated ping frames.
+	// It must be shorter than the pong wait so a healthy client always has time
+	// to answer before the read deadline expires.
+	DefaultWSPingPeriod = (DefaultWSPongWait * 9) / 10
+
+	// DefaultWSWriteWait bounds how long a single frame write may block. A peer
+	// that stops draining its receive window is reaped once this expires.
+	DefaultWSWriteWait = 10 * time.Second
+
+	// DefaultWSTCPKeepAlivePeriod is the OS-level TCP keepalive probe interval
+	// applied to hijacked connections.
+	DefaultWSTCPKeepAlivePeriod = 30 * time.Second
 )
 
 // Common rate limiting errors.
@@ -516,6 +538,53 @@ func NormalizeIP(raw string) string {
 // WebSocket Connection & Server Primitives
 // ---------------------------------------------------------------------------
 
+// WSKeepaliveConfig controls how aggressively unresponsive WebSocket peers are reaped.
+//
+// Clients on unreliable networks often vanish without sending a TCP FIN, which
+// would otherwise leave the handler goroutine blocked in ReadMessage forever.
+// The server defends against this at two layers:
+//   - OS-level TCP keepalive probes on the underlying socket, and
+//   - RFC 6455 ping/pong with a rolling read deadline: every frame received from
+//     the client pushes the deadline forward by PongWait, and the server sends a
+//     ping every PingPeriod so healthy-but-quiet clients still produce traffic.
+//
+// Handlers must keep calling ReadMessage (even if they only push data) so that
+// pong frames are consumed and the read deadline is observed.
+type WSKeepaliveConfig struct {
+	// PongWait is the read deadline extended on every received frame.
+	// Zero or negative disables the read deadline.
+	PongWait time.Duration
+
+	// PingPeriod is the interval between server pings. It is clamped below
+	// PongWait. Zero or negative disables server pings.
+	PingPeriod time.Duration
+
+	// WriteWait is the per-frame write deadline. Zero or negative disables it.
+	WriteWait time.Duration
+
+	// TCPKeepAlivePeriod is the TCP keepalive probe interval for the underlying
+	// socket. Zero or negative disables TCP keepalives.
+	TCPKeepAlivePeriod time.Duration
+}
+
+// DefaultWSKeepaliveConfig returns production defaults for WSKeepaliveConfig.
+func DefaultWSKeepaliveConfig() WSKeepaliveConfig {
+	return WSKeepaliveConfig{
+		PongWait:           DefaultWSPongWait,
+		PingPeriod:         DefaultWSPingPeriod,
+		WriteWait:          DefaultWSWriteWait,
+		TCPKeepAlivePeriod: DefaultWSTCPKeepAlivePeriod,
+	}
+}
+
+// normalized returns a copy of cfg with PingPeriod clamped below PongWait.
+func (cfg WSKeepaliveConfig) normalized() WSKeepaliveConfig {
+	if cfg.PongWait > 0 && cfg.PingPeriod >= cfg.PongWait {
+		cfg.PingPeriod = (cfg.PongWait * 9) / 10
+	}
+	return cfg
+}
+
 // WSConn wraps a hijacked network connection with WebSocket framing capabilities
 // and automatic rate limiter release upon closure.
 type WSConn struct {
@@ -525,26 +594,80 @@ type WSConn struct {
 	ClientIP  string
 	releaseFn func()
 	closed    int32
+
+	keepalive WSKeepaliveConfig
+	writeMu   sync.Mutex
+	done      chan struct{}
 }
 
 // ReadMessage reads a complete WebSocket text or binary message from the client.
+//
+// Control frames are handled transparently: pings are answered with pongs,
+// pongs are consumed, and a close frame yields io.EOF. Every received frame
+// extends the read deadline by the configured pong wait, so a peer that goes
+// silent (including one that disappeared without a TCP FIN) causes ReadMessage
+// to fail with a timeout error once the deadline elapses.
 func (c *WSConn) ReadMessage() ([]byte, error) {
-	return wsReadMessage(c.Reader)
+	var buf bytes.Buffer
+	for {
+		fin, opcode, payload, err := wsReadRawFrame(c.Reader)
+		if err != nil {
+			return nil, err
+		}
+		c.extendReadDeadline()
+
+		switch opcode {
+		case 0x8: // close
+			return nil, io.EOF
+		case 0x9: // ping — reply with a pong echoing the payload
+			if err := c.writeControl(0xA, payload); err != nil {
+				return nil, err
+			}
+		case 0xA: // pong — liveness already recorded by the deadline extension
+		case 0x0, 0x1, 0x2: // continuation, text, binary
+			buf.Write(payload)
+			if fin {
+				return buf.Bytes(), nil
+			}
+		default:
+			return nil, fmt.Errorf("ws: unexpected opcode 0x%x", opcode)
+		}
+	}
 }
 
 // WriteMessage sends an unmasked text frame to the client per RFC 6455 §5.1.
 func (c *WSConn) WriteMessage(payload []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.setWriteDeadline()
 	return wsWriteServerFrame(c.Writer, payload)
+}
+
+// Ping sends a ping control frame to the client.
+func (c *WSConn) Ping() error {
+	return c.writeControl(0x9, nil)
 }
 
 // Close closes the underlying network connection and releases the concurrency slot in the limiter.
 func (c *WSConn) Close() error {
 	if atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
+		if c.done != nil {
+			close(c.done)
+		}
 		if c.releaseFn != nil {
 			c.releaseFn()
 		}
-		// Send close frame to peer (best effort)
+		// Send close frame to peer (best effort). Arming the write deadline
+		// before taking writeMu also unblocks any writer stuck on a dead peer,
+		// so Close can never hang indefinitely.
+		closeWait := c.keepalive.WriteWait
+		if closeWait <= 0 {
+			closeWait = DefaultWSWriteWait
+		}
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(closeWait))
+		c.writeMu.Lock()
 		_ = wsWriteServerCloseFrame(c.Writer)
+		c.writeMu.Unlock()
 		return c.Conn.Close()
 	}
 	return nil
@@ -553,6 +676,97 @@ func (c *WSConn) Close() error {
 // RemoteAddr returns the remote network address of the connection.
 func (c *WSConn) RemoteAddr() net.Addr {
 	return c.Conn.RemoteAddr()
+}
+
+// writeControl writes an unmasked control frame (ping/pong) to the client.
+func (c *WSConn) writeControl(opcode byte, payload []byte) error {
+	if len(payload) > 125 {
+		return fmt.Errorf("ws: control frame payload too large (%d bytes)", len(payload))
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.setWriteDeadline()
+	if _, err := c.Writer.Write([]byte{0x80 | opcode, byte(len(payload))}); err != nil {
+		return fmt.Errorf("ws: write control frame: %w", err)
+	}
+	if len(payload) > 0 {
+		if _, err := c.Writer.Write(payload); err != nil {
+			return fmt.Errorf("ws: write control payload: %w", err)
+		}
+	}
+	return c.Writer.Flush()
+}
+
+// extendReadDeadline pushes the read deadline forward by the pong wait.
+func (c *WSConn) extendReadDeadline() {
+	if c.keepalive.PongWait > 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.keepalive.PongWait))
+	}
+}
+
+// setWriteDeadline arms the per-frame write deadline. Must hold c.writeMu.
+func (c *WSConn) setWriteDeadline() {
+	if c.keepalive.WriteWait > 0 {
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(c.keepalive.WriteWait))
+	}
+}
+
+// startKeepalive enables TCP keepalives, arms the initial read deadline and
+// launches the ping loop. The ping loop exits when the connection is closed and
+// closes the connection itself if a ping cannot be delivered.
+func (c *WSConn) startKeepalive() {
+	enableTCPKeepAlive(c.Conn, c.keepalive.TCPKeepAlivePeriod)
+	c.extendReadDeadline()
+
+	if c.keepalive.PingPeriod <= 0 || c.done == nil {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(c.keepalive.PingPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.Ping(); err != nil {
+					if logger.Logger != nil {
+						logger.Logger.Debug("WebSocket ping failed; reaping connection",
+							"ip", c.ClientIP, "error", err)
+					}
+					_ = c.Close()
+					return
+				}
+			case <-c.done:
+				return
+			}
+		}
+	}()
+}
+
+// tcpKeepAliver is implemented by *net.TCPConn.
+type tcpKeepAliver interface {
+	SetKeepAlive(bool) error
+	SetKeepAlivePeriod(time.Duration) error
+}
+
+// enableTCPKeepAlive turns on OS-level TCP keepalive probes for conn, unwrapping
+// connection wrappers that expose the underlying connection via NetConn().
+func enableTCPKeepAlive(conn net.Conn, period time.Duration) {
+	if period <= 0 {
+		return
+	}
+	for i := 0; conn != nil && i < 8; i++ {
+		if ka, ok := conn.(tcpKeepAliver); ok {
+			_ = ka.SetKeepAlive(true)
+			_ = ka.SetKeepAlivePeriod(period)
+			return
+		}
+		u, ok := conn.(interface{ NetConn() net.Conn })
+		if !ok {
+			return
+		}
+		conn = u.NetConn()
+	}
 }
 
 // wsWriteServerFrame writes an unmasked WebSocket frame to w.
@@ -612,12 +826,20 @@ func WithWSAuthToken(token string) WSServerOption {
 	}
 }
 
+// WithWSKeepalive overrides the keepalive/dead-peer reaping configuration.
+func WithWSKeepalive(cfg WSKeepaliveConfig) WSServerOption {
+	return func(s *WSServer) {
+		s.keepalive = cfg.normalized()
+	}
+}
+
 // WSServer is an HTTP handler that terminates incoming WebSocket connections,
 // enforcing per-IP token-bucket rate limiting and concurrent connection caps.
 type WSServer struct {
 	limiter   *WSRateLimiter
 	handler   WSConnHandler
 	authToken string
+	keepalive WSKeepaliveConfig
 	mu        sync.RWMutex
 	conns     map[*WSConn]struct{}
 }
@@ -629,9 +851,10 @@ func NewWSServer(limiter *WSRateLimiter, handler WSConnHandler, opts ...WSServer
 	}
 
 	srv := &WSServer{
-		limiter: limiter,
-		handler: handler,
-		conns:   make(map[*WSConn]struct{}),
+		limiter:   limiter,
+		handler:   handler,
+		keepalive: DefaultWSKeepaliveConfig(),
+		conns:     make(map[*WSConn]struct{}),
 	}
 
 	for _, opt := range opts {
@@ -773,7 +996,10 @@ func (s *WSServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Writer:    bufrw.Writer,
 		ClientIP:  clientIP,
 		releaseFn: release,
+		keepalive: s.keepalive,
+		done:      make(chan struct{}),
 	}
+	wsConn.startKeepalive()
 
 	s.mu.Lock()
 	s.conns[wsConn] = struct{}{}
@@ -876,6 +1102,11 @@ type wsTrackedNetConn struct {
 	net.Conn
 	releaseFn func()
 	once      sync.Once
+}
+
+// NetConn returns the wrapped connection so TCP options can be applied to it.
+func (c *wsTrackedNetConn) NetConn() net.Conn {
+	return c.Conn
 }
 
 func (c *wsTrackedNetConn) Close() error {

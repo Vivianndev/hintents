@@ -762,3 +762,129 @@ func TestRateLimitMiddleware(t *testing.T) {
 	assert.False(t, nextHandlerCalled, "handler must not be called when rate limited")
 	assert.Equal(t, http.StatusTooManyRequests, rec3.Code)
 }
+
+// ---------------------------------------------------------------------------
+// Keepalive / dead-peer reaping Tests
+// ---------------------------------------------------------------------------
+
+// dialMockWS upgrades a mock connection against srv and consumes the handshake
+// response, returning the mock writer and a reader positioned at the first frame.
+func dialMockWS(t *testing.T, srv *WSServer, remoteAddr string) (*mockHijackableWriter, *bufio.Reader) {
+	t.Helper()
+
+	rec := newMockHijackableWriter()
+	req := httptest.NewRequest("GET", "/ws", nil)
+	req.RemoteAddr = remoteAddr
+	req.Header.Set("Upgrade", "websocket")
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Sec-WebSocket-Key", wsGenKey())
+
+	go srv.ServeHTTP(rec, req)
+
+	br := bufio.NewReader(rec.clientConn)
+	statusLine, err := br.ReadString('\n')
+	require.NoError(t, err)
+	require.Contains(t, statusLine, "101 Switching Protocols")
+	for {
+		line, err := br.ReadString('\n')
+		require.NoError(t, err)
+		if strings.TrimRight(line, "\r\n") == "" {
+			break
+		}
+	}
+	return rec, br
+}
+
+// writeMaskedControl writes a masked client control frame with an empty payload.
+func writeMaskedControl(conn net.Conn, opcode byte) error {
+	_, err := conn.Write([]byte{0x80 | opcode, 0x80, 0, 0, 0, 0})
+	return err
+}
+
+func drainingHandler(conn *WSConn) {
+	for {
+		if _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+	}
+}
+
+func TestWSKeepaliveConfig_NormalizedClampsPingPeriod(t *testing.T) {
+	cfg := WSKeepaliveConfig{PongWait: 10 * time.Second, PingPeriod: 20 * time.Second}.normalized()
+	assert.Equal(t, 9*time.Second, cfg.PingPeriod)
+
+	def := DefaultWSKeepaliveConfig()
+	assert.Less(t, def.PingPeriod, def.PongWait)
+}
+
+func TestWSServer_Keepalive_ReapsUnresponsivePeer(t *testing.T) {
+	limiter := NewWSRateLimiter(WSRateLimiterConfig{MaxConcurrent: 2, Capacity: 5, RefillRate: 5})
+	defer limiter.Close()
+
+	srv := NewWSServer(limiter, drainingHandler, WithWSKeepalive(WSKeepaliveConfig{
+		PongWait:   150 * time.Millisecond,
+		PingPeriod: 50 * time.Millisecond,
+		WriteWait:  50 * time.Millisecond,
+	}))
+	defer func() { _ = srv.Close() }()
+
+	rec, _ := dialMockWS(t, srv, "10.20.30.40:1234")
+	defer rec.Close()
+
+	assert.Eventually(t, func() bool {
+		return limiter.ActiveConnections("10.20.30.40") == 1
+	}, time.Second, 5*time.Millisecond)
+
+	// The client now goes silent without closing: no reads, no pongs, no FIN.
+	assert.Eventually(t, func() bool {
+		return limiter.ActiveConnections("10.20.30.40") == 0 && srv.ActiveConnections() == 0
+	}, 2*time.Second, 10*time.Millisecond, "unresponsive peer should be reaped")
+}
+
+func TestWSServer_Keepalive_ResponsivePeerStaysConnected(t *testing.T) {
+	limiter := NewWSRateLimiter(WSRateLimiterConfig{MaxConcurrent: 2, Capacity: 5, RefillRate: 5})
+	defer limiter.Close()
+
+	srv := NewWSServer(limiter, drainingHandler, WithWSKeepalive(WSKeepaliveConfig{
+		PongWait:   150 * time.Millisecond,
+		PingPeriod: 40 * time.Millisecond,
+		WriteWait:  100 * time.Millisecond,
+	}))
+	defer func() { _ = srv.Close() }()
+
+	rec, br := dialMockWS(t, srv, "10.20.30.41:1234")
+	defer rec.Close()
+
+	// Answer server pings for well over PongWait.
+	pings := 0
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		require.NoError(t, rec.clientConn.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+		_, opcode, _, err := wsReadRawFrame(br)
+		require.NoError(t, err, "server should keep pinging a live client")
+		if opcode == 0x9 {
+			pings++
+			require.NoError(t, writeMaskedControl(rec.clientConn, 0xA))
+		}
+	}
+
+	assert.GreaterOrEqual(t, pings, 3)
+	assert.Equal(t, 1, srv.ActiveConnections())
+	assert.Equal(t, 1, limiter.ActiveConnections("10.20.30.41"))
+}
+
+func TestWSServer_Keepalive_RepliesToClientPing(t *testing.T) {
+	srv := NewWSServer(nil, drainingHandler)
+	defer func() { _ = srv.Close() }()
+
+	rec, br := dialMockWS(t, srv, "10.20.30.42:1234")
+	defer rec.Close()
+
+	require.NoError(t, writeMaskedControl(rec.clientConn, 0x9))
+
+	require.NoError(t, rec.clientConn.SetReadDeadline(time.Now().Add(time.Second)))
+	_, opcode, payload, err := wsReadRawFrame(br)
+	require.NoError(t, err)
+	assert.Equal(t, byte(0xA), opcode)
+	assert.Empty(t, payload)
+}
