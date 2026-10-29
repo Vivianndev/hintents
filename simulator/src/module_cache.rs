@@ -1,3 +1,17 @@
+// Copyright 2025 Hintents Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -7,7 +21,18 @@ use wasmparser::{Parser, Payload};
 
 /// Custom section names that are not required for execution and can be
 /// stripped before instantiation to reduce per-instance memory usage.
-const STRIPPABLE_CUSTOM_SECTIONS: &[&str] = &["name", ".debug_info", ".debug_abbrev", ".debug_line", ".debug_str", ".debug_ranges", ".debug_loc", ".debug_aranges", ".debug_pubnames", ".debug_pubtypes"];
+const STRIPPABLE_CUSTOM_SECTIONS: &[&str] = &[
+    "name",
+    ".debug_info",
+    ".debug_abbrev",
+    ".debug_line",
+    ".debug_str",
+    ".debug_ranges",
+    ".debug_loc",
+    ".debug_aranges",
+    ".debug_pubnames",
+    ".debug_pubtypes",
+];
 
 /// Returns a copy of the WASM binary with non-essential custom sections removed.
 ///
@@ -23,26 +48,20 @@ pub fn strip_custom_sections(wasm: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(wasm.len());
     out.extend_from_slice(&wasm[0..8]);
 
-    // Byte range of the current top-level section, tracked via the parser.
-    let mut section_start: Option<usize> = None;
     let mut last_end: usize = 8;
 
     for payload in Parser::new(0).parse_all(wasm) {
         match payload? {
             Payload::Version { .. } => {}
             Payload::CustomSection(reader) => {
-                let range = reader.range();
-                // range covers the section payload; the section header (id + size)
-                // precedes it. Recover the full section extent from the reader.
-                let full_start = section_start.unwrap_or(range.start);
-                let full_end = range.end;
+                // `range()` covers the section payload; the section end is the
+                // exclusive end of that range.
+                let full_end = reader.range().end;
                 let name = reader.name();
                 if !STRIPPABLE_CUSTOM_SECTIONS.contains(&name) {
                     out.extend_from_slice(&wasm[last_end..full_end]);
                 }
                 last_end = full_end;
-                let _ = full_start;
-                section_start = None;
             }
             Payload::End(offset) => {
                 out.extend_from_slice(&wasm[last_end..offset]);
@@ -73,7 +92,10 @@ impl ModuleCache {
     /// on first use.
     pub fn get_or_prepare(&self, wasm: &[u8]) -> Result<Arc<Vec<u8>>> {
         let key: [u8; 32] = Sha256::digest(wasm).into();
-        let mut entries = self.entries.lock().map_err(|_| anyhow!("module cache poisoned"))?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("module cache poisoned"))?;
         if let Some(existing) = entries.get(&key) {
             return Ok(Arc::clone(existing));
         }
